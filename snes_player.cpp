@@ -17,7 +17,7 @@
 #define SNES_SAMPLE_RATE    22050
 #define SNES_SOUND_BUF_LEN  4096
 #define RING_BUF_SIZE       (SNES_SOUND_BUF_LEN * 16)
-#define TARGET_FPS          60
+#define TARGET_FPS          120
 #define DELAY_FRAME         (1000 / TARGET_FPS)
 
 // Búfer circular para el streaming de audio en SDL
@@ -34,8 +34,7 @@ extern "C"
 	extern uint8_t MixBuffer[];
 }
 
-// Callback de audio de SDL para alimentar las bocinas desde el búfer
-// circular
+// Callback de audio de SDL para alimentar las bocinas
 void snes_audio_callback(void *userdata, uint8_t * stream, int len)
 {
 	uint32_t head = ring_head;
@@ -63,7 +62,7 @@ bool8_32 S9xOpenSoundDevice(int mode, bool8_32 stereo, int buffer_size)
 	ring_tail = 0;
 
 	SDL_AudioSpec wanted;
-	wanted.freq = SNES_SAMPLE_RATE;
+	wanted.freq = 22050;         
 	wanted.format = AUDIO_S16SYS;
 	wanted.channels = 2;
 	wanted.samples = 512;
@@ -74,7 +73,14 @@ bool8_32 S9xOpenSoundDevice(int mode, bool8_32 stereo, int buffer_size)
 		return FALSE;
 
 	so.sound_fd = 7;
+	so.playback_rate = 22050;
+	so.stereo = 1;
+	so.sixteen_bit = 1;
+	so.buffer_size = buffer_size;
 	so.samples_mixed_so_far = 0;
+	so.play_position = 0;
+	so.mute_sound = FALSE;
+
 	SDL_PauseAudio(0);
 	return TRUE;
 }
@@ -82,11 +88,16 @@ bool8_32 S9xOpenSoundDevice(int mode, bool8_32 stereo, int buffer_size)
 // Copia las muestras generadas por la APU de SNES al búfer de SDL
 void S9xProcessSound()
 {
-	int sample_count = so.samples_mixed_so_far;
-	if (sample_count <= 0)
-		return;
+	// EXTRACTOR MANUAL: Forzamos al mezclador clásico a vaciar la APU en MixBuffer.
+	// 22050Hz / 60 FPS = 367 muestras estéreo por fotograma.
+	int sample_count = 367; 
+	
+	// Llamamos a la función nativa que sí enlaza para obligar al núcleo a mezclar
+	S9xMixSamplesO(MixBuffer, sample_count, 0);
 
+	// 1 muestra estéreo de 16 bits ocupará exactamente 4 bytes
 	int bytes_ready = sample_count * 4;
+	
 	uint32_t head = ring_head;
 	uint32_t tail = ring_tail;
 	uint32_t ocupado = (head >= tail) ? (head - tail) : (RING_BUF_SIZE - tail + head);
@@ -110,24 +121,22 @@ void S9xProcessSound()
 	so.samples_mixed_so_far = 0;
 }
 
-// Controla los FPS y el ritmo del procesamiento de audio
-void S9xSyncSpeed()
+void S9xSyncSpeed() 
 {
-	static uint32_t next_frame_time = 0;
-	uint32_t now = SDL_GetTicks();
-	if (next_frame_time == 0)
-		next_frame_time = now;
+    static uint32_t next_frame_time = 0;
+    uint32_t now = SDL_GetTicks();
+    if (next_frame_time == 0) next_frame_time = now;
 
-	if (now < next_frame_time)
-	{
-		SDL_Delay(next_frame_time - now);
-	}
-	next_frame_time += DELAY_FRAME;
+    if (now < next_frame_time) {
+        SDL_Delay(next_frame_time - now);
+    }
+    next_frame_time += DELAY_FRAME;
 
-	S9xProcessSound();
+    // Forzamos el volcado directo del audio procesado hacia SDL
+    S9xProcessSound();
 }
 
-// Lee el estado de los controles (cruceta y botones básicos)
+// Lee el estado de los controles
 void do_snes_keypad()
 {
 	snes_joypad = 0x80000000;
@@ -170,7 +179,7 @@ uint32 S9xReadJoypad(int port)
 }
 
 // =========================================================
-// ESTA ES LA FUNCIÓN PERDIDA RECONSTRUIDA DE RAÍZ
+// FUNCIÓN DE ENTRADA LLAMADA DESDE MAIN.CPP
 // =========================================================
 extern "C" void run_snes_emulator(const char *fn)
 {
@@ -188,19 +197,21 @@ extern "C" void run_snes_emulator(const char *fn)
 	Settings.FrameTimeNTSC = 16667;
 	Settings.FrameTime = Settings.FrameTimeNTSC;
 	Settings.DisableSampleCaching = FALSE;
-	Settings.DisableMasterVolume = TRUE;
+	Settings.DisableMasterVolume = FALSE; 
 	Settings.Transparency = TRUE;
 	Settings.SixteenBit = TRUE;
 	Settings.SupportHiRes = FALSE;
+	
+	SoundData.master_volume_left = 127;
+	SoundData.master_volume_right = 127;
+	SoundData.master_volume[0] = 127;
+	SoundData.master_volume[1] = 127;
 
+	Settings.NextAPUEnabled = TRUE;
 	Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
 
 	if (!Memory.Init() || !S9xInitAPU())
 		return;
-
-	S9xOpenSoundDevice(Settings.SoundPlaybackRate, Settings.Stereo, Settings.SoundBufferSize);
-	S9xSetSoundMute(FALSE);
-	S9xSetRenderPixelFormat(RGB565);
 
 	GFX.Screen = (uint8 *) malloc(320 * 240 * 2);
 	GFX.Pitch = 320 * 2;
@@ -210,8 +221,18 @@ extern "C" void run_snes_emulator(const char *fn)
 
 	if (!S9xGraphicsInit())
 		return;
+
+	// 1. CARGAMOS LA ROM
 	if (!Memory.LoadROM(fn))
 		return;
+
+	// 2. DISPARADORES DE AUDIO TRAS LA RAM LIMPIA
+	S9xOpenSoundDevice(Settings.SoundPlaybackRate, Settings.Stereo, Settings.SoundBufferSize);
+	S9xSetPlaybackRate(22050); 
+	S9xResetSound(FALSE);      // Reseteo forzado del procesador de audio clasico
+	S9xSetSoundControl(0xFF);  // Habilitar todos los canales
+	S9xSetSoundMute(FALSE);    // Desactivar mute por hardware
+	S9xSetRenderPixelFormat(RGB565);
 
 	SDL_Surface *screen = SDL_SetVideoMode(320, 240, 16, SDL_HWSURFACE | SDL_DOUBLEBUF);
 	if (!screen)
@@ -229,36 +250,30 @@ extern "C" void run_snes_emulator(const char *fn)
 		}
 
 		do_snes_keypad();
+		
+		// Corre un fotograma completo de emulación
 		S9xMainLoop();
 
-		// Volcar búfer gráfico aplicando escalador a 320x240
+		// Regula FPS y extrae el audio mezclado hacia SDL
+		S9xSyncSpeed();
+
 		SDL_LockSurface(screen);
 
 		uint16_t *snes_buffer = (uint16_t *) GFX.Screen;
 		uint16_t *sdl_pixels = (uint16_t *) screen->pixels;
-		int sdl_pitch = screen->pitch / 2;	// Convertir pitch de bytes a
-											// shorts (16-bit)
+		int sdl_pitch = screen->pitch / 2;	
 
-		// El núcleo de Snes9x antiguo suele renderizar a 256x224 útiles
 		const int snes_w = 256;
 		const int snes_h = 224;
 
 		for (int y = 0; y < 240; y++)
 		{
-			// Mapeo vertical: calculamos qué fila de la SNES corresponde a
-			// la fila actual de SDL
 			int snes_y = (y * snes_h) / 240;
-
-			uint16_t *src_row = snes_buffer + (snes_y * 320);	// El pitch
-																// interno de
-																// GFX.Screen
-																// es 320
+			uint16_t *src_row = snes_buffer + (snes_y * 320);	
 			uint16_t *dest_row = sdl_pixels + (y * sdl_pitch);
 
 			for (int x = 0; x < 320; x++)
 			{
-				// Mapeo horizontal: estiramos los 256 píxeles para ocupar
-				// los 320 de la pantalla
 				int snes_x = (x * snes_w) / 320;
 				dest_row[x] = src_row[snes_x];
 			}
@@ -266,7 +281,6 @@ extern "C" void run_snes_emulator(const char *fn)
 
 		SDL_UnlockSurface(screen);
 		SDL_Flip(screen);
-
 	}
 
 	SDL_CloseAudio();
@@ -274,26 +288,10 @@ extern "C" void run_snes_emulator(const char *fn)
 	S9xDeinitAPU();
 	S9xGraphicsDeinit();
 
-	if (GFX.Screen)
-	{
-		free(GFX.Screen);
-		GFX.Screen = NULL;
-	}
-	if (GFX.SubScreen)
-	{
-		free(GFX.SubScreen);
-		GFX.SubScreen = NULL;
-	}
-	if (GFX.ZBuffer)
-	{
-		free(GFX.ZBuffer);
-		GFX.ZBuffer = NULL;
-	}
-	if (GFX.SubZBuffer)
-	{
-		free(GFX.SubZBuffer);
-		GFX.SubZBuffer = NULL;
-	}
+	if (GFX.Screen) { free(GFX.Screen); GFX.Screen = NULL; }
+	if (GFX.SubScreen) { free(GFX.SubScreen); GFX.SubScreen = NULL; }
+	if (GFX.ZBuffer) { free(GFX.ZBuffer); GFX.ZBuffer = NULL; }
+	if (GFX.SubZBuffer) { free(GFX.SubZBuffer); GFX.SubZBuffer = NULL; }
 }
 
 void S9xExit()
@@ -320,14 +318,22 @@ extern "C"
 	void S9xMessage(int type, int number, const char *message)
 	{
 	}
+
 	void S9xGenerateSound()
 	{
-		S9xProcessSound();
+		// Satisface cpuexec.cpp sin causar errores de enlazador
 	}
+
+	void S9xPutImage(int width, int height)
+	{
+		// Satisface display.h
+	}
+
 	bool8_32 S9xDeinitUpdate(int width, int height)
 	{
 		return TRUE;
 	}
+
 	void S9xSetPalette()
 	{
 	}
@@ -340,6 +346,7 @@ extern "C"
 			*stream = OPEN_STREAM(filepath, "wb");
 		return (*stream != NULL);
 	}
+
 	void S9xCloseSnapshotFile(STREAM stream)
 	{
 		CLOSE_STREAM(stream);
