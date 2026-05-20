@@ -4,7 +4,10 @@
 #include <string.h>
 #include <SDL/SDL.h>
 
-// Cabeceras del núcleo del emulador
+// =========================================================
+// SNES9X
+// =========================================================
+
 #include "snes/snes9x.h"
 #include "snes/apu.h"
 #include "snes/memmap.h"
@@ -13,300 +16,546 @@
 #include "snes/display.h"
 #include "snes/cpuexec.h"
 
-// Constantes de rendimiento y sincronización
-#define SNES_SAMPLE_RATE    22050
-#define SNES_SOUND_BUF_LEN  4096
-#define RING_BUF_SIZE       (SNES_SOUND_BUF_LEN * 16)
-#define TARGET_FPS          120
-#define DELAY_FRAME         (1000 / TARGET_FPS)
+// =========================================================
+// CONFIG
+// =========================================================
 
-// Búfer circular para el streaming de audio en SDL
+#define SNES_SAMPLE_RATE    22050
+#define SNES_FPS            60.0988
+#define AUDIO_SAMPLES       512
+#define RING_BUF_SIZE       65536
+
+// =========================================================
+// GLOBALS
+// =========================================================
+
+static bool GameLooping = true;
+static uint32 snes_joypad = 0;
+
+int m_nVolume = 100;
+
+// =========================================================
+// AUDIO BUFFER
+// =========================================================
+
 static uint8_t RingBuffer[RING_BUF_SIZE];
+
 static volatile uint32_t ring_head = 0;
 static volatile uint32_t ring_tail = 0;
 
-static uint32_t snes_joypad = 0;
-static bool GameLooping = true;
-int m_nVolume = 100;
+// =========================================================
+// EXTERN MIXBUFFER
+// =========================================================
 
 extern "C"
 {
-	extern uint8_t MixBuffer[];
+    extern uint8_t MixBuffer[];
 }
 
-// Callback de audio de SDL para alimentar las bocinas
-void snes_audio_callback(void *userdata, uint8_t * stream, int len)
+// =========================================================
+// AUDIO BUFFER UTILS
+// =========================================================
+
+static inline uint32_t audio_buffer_used()
 {
-	uint32_t head = ring_head;
-	uint32_t tail = ring_tail;
-	uint32_t available = (head >= tail) ? (head - tail) : (RING_BUF_SIZE - tail + head);
+    uint32_t head = ring_head;
+    uint32_t tail = ring_tail;
 
-	if (available < (uint32_t) len)
-	{
-		memset(stream, 0, len);
-		return;
-	}
+    if (head >= tail)
+        return head - tail;
 
-	for (int i = 0; i < len; i++)
-	{
-		stream[i] = RingBuffer[ring_tail];
-		ring_tail = (ring_tail + 1) % RING_BUF_SIZE;
-	}
+    return RING_BUF_SIZE - tail + head;
 }
 
-// Abre el hardware de audio usando la librería SDL
-bool8_32 S9xOpenSoundDevice(int mode, bool8_32 stereo, int buffer_size)
+static inline uint32_t audio_buffer_free()
 {
-	memset(RingBuffer, 0, sizeof(RingBuffer));
-	ring_head = 0;
-	ring_tail = 0;
-
-	SDL_AudioSpec wanted;
-	wanted.freq = 22050;         
-	wanted.format = AUDIO_S16SYS;
-	wanted.channels = 2;
-	wanted.samples = 512;
-	wanted.callback = snes_audio_callback;
-	wanted.userdata = NULL;
-
-	if (SDL_OpenAudio(&wanted, NULL) < 0)
-		return FALSE;
-
-	so.sound_fd = 7;
-	so.playback_rate = 22050;
-	so.stereo = 1;
-	so.sixteen_bit = 1;
-	so.buffer_size = buffer_size;
-	so.samples_mixed_so_far = 0;
-	so.play_position = 0;
-	so.mute_sound = FALSE;
-
-	SDL_PauseAudio(0);
-	return TRUE;
+    return (RING_BUF_SIZE - 1) - audio_buffer_used();
 }
 
-// Copia las muestras generadas por la APU de SNES al búfer de SDL
+// =========================================================
+// SDL AUDIO CALLBACK
+// =========================================================
+
+void snes_audio_callback(
+    void *userdata,
+    Uint8 *stream,
+    int len)
+{
+    uint32_t available =
+        audio_buffer_used();
+
+    if (available < (uint32_t)len)
+    {
+        memset(stream, 0, len);
+        return;
+    }
+
+    for (int i = 0; i < len; i++)
+    {
+        stream[i] =
+            RingBuffer[ring_tail];
+
+        ring_tail =
+            (ring_tail + 1) % RING_BUF_SIZE;
+    }
+}
+
+// =========================================================
+// OPEN SOUND
+// =========================================================
+
+bool8_32 S9xOpenSoundDevice(
+    int mode,
+    bool8_32 stereo,
+    int buffer_size)
+{
+    memset(RingBuffer, 0, sizeof(RingBuffer));
+
+    ring_head = 0;
+    ring_tail = 0;
+
+    SDL_AudioSpec wanted;
+
+    wanted.freq = SNES_SAMPLE_RATE;
+    wanted.format = AUDIO_S16SYS;
+    wanted.channels = 2;
+    wanted.samples = AUDIO_SAMPLES;
+    wanted.callback = snes_audio_callback;
+    wanted.userdata = NULL;
+
+    if (SDL_OpenAudio(&wanted, NULL) < 0)
+    {
+        printf("SDL_OpenAudio failed\n");
+        return FALSE;
+    }
+
+    so.sound_fd = 1;
+    so.playback_rate = SNES_SAMPLE_RATE;
+    so.stereo = TRUE;
+    so.sixteen_bit = TRUE;
+    so.buffer_size = buffer_size;
+    so.samples_mixed_so_far = 0;
+    so.play_position = 0;
+    so.mute_sound = FALSE;
+
+    SDL_PauseAudio(0);
+
+    return TRUE;
+}
+
+// =========================================================
+// PROCESS SOUND
+// =========================================================
+
 void S9xProcessSound()
 {
-	// EXTRACTOR MANUAL: Forzamos al mezclador clásico a vaciar la APU en MixBuffer.
-	// 22050Hz / 60 FPS = 367 muestras estéreo por fotograma.
-	int sample_count = 367; 
-	
-	// Llamamos a la función nativa que sí enlaza para obligar al núcleo a mezclar
-	S9xMixSamplesO(MixBuffer, sample_count, 0);
+    static double sample_accumulator = 0.0;
 
-	// 1 muestra estéreo de 16 bits ocupará exactamente 4 bytes
-	int bytes_ready = sample_count * 4;
-	
-	uint32_t head = ring_head;
-	uint32_t tail = ring_tail;
-	uint32_t ocupado = (head >= tail) ? (head - tail) : (RING_BUF_SIZE - tail + head);
-	uint32_t espacio_libre = RING_BUF_SIZE - ocupado - 1;
+    sample_accumulator +=
+        ((double)SNES_SAMPLE_RATE / SNES_FPS);
 
-	if (espacio_libre < (uint32_t) bytes_ready)
-	{
-		so.samples_mixed_so_far = 0;
-		return;
-	}
+    int sample_count =
+        (int)sample_accumulator;
 
-	SDL_LockAudio();
-	uint8_t *core_sound_ptr = (uint8_t *) MixBuffer;
-	for (int i = 0; i < bytes_ready; i++)
-	{
-		RingBuffer[ring_head] = core_sound_ptr[i];
-		ring_head = (ring_head + 1) % RING_BUF_SIZE;
-	}
-	SDL_UnlockAudio();
+    sample_accumulator -= sample_count;
 
-	so.samples_mixed_so_far = 0;
-}
+    if (sample_count <= 0)
+        return;
 
-void S9xSyncSpeed() 
-{
-    static uint32_t next_frame_time = 0;
-    uint32_t now = SDL_GetTicks();
-    if (next_frame_time == 0) next_frame_time = now;
+    // =====================================================
+    // IMPORTANTE:
+    // Algunas versiones de Snes9x esperan
+    // sample_count * 2 en stereo
+    // =====================================================
 
-    if (now < next_frame_time) {
-        SDL_Delay(next_frame_time - now);
+    S9xMixSamplesO(
+        MixBuffer,
+        sample_count * 2,
+        0);
+
+    // 16-bit stereo
+    int bytes_ready =
+        sample_count * 4;
+
+    if (audio_buffer_free() <
+        (uint32_t)bytes_ready)
+    {
+        return;
     }
-    next_frame_time += DELAY_FRAME;
 
-    // Forzamos el volcado directo del audio procesado hacia SDL
-    S9xProcessSound();
+    uint8_t *src =
+        (uint8_t *)MixBuffer;
+
+    SDL_LockAudio();
+
+    for (int i = 0; i < bytes_ready; i++)
+    {
+        RingBuffer[ring_head] = src[i];
+
+        ring_head =
+            (ring_head + 1) %
+            RING_BUF_SIZE;
+    }
+
+    SDL_UnlockAudio();
+
+    so.samples_mixed_so_far = 0;
 }
 
-// Lee el estado de los controles
+// =========================================================
+// AUDIO DRIVEN SYNC
+// =========================================================
+
+void S9xSyncSpeed()
+{
+    while (audio_buffer_used() >
+          (RING_BUF_SIZE / 2))
+    {
+        SDL_Delay(1);
+    }
+}
+
+// =========================================================
+// INPUT
+// =========================================================
+
 void do_snes_keypad()
 {
-	snes_joypad = 0x80000000;
-	Uint8 *keystate = SDL_GetKeyState(NULL);
+    snes_joypad = 0x80000000;
 
-	if (keystate[SDLK_UP])
-		snes_joypad |= SNES_UP_MASK;
-	if (keystate[SDLK_DOWN])
-		snes_joypad |= SNES_DOWN_MASK;
-	if (keystate[SDLK_LEFT])
-		snes_joypad |= SNES_LEFT_MASK;
-	if (keystate[SDLK_RIGHT])
-		snes_joypad |= SNES_RIGHT_MASK;
-	if (keystate[SDLK_z])
-		snes_joypad |= SNES_A_MASK;
-	if (keystate[SDLK_x])
-		snes_joypad |= SNES_B_MASK;
-	if (keystate[SDLK_a])
-		snes_joypad |= SNES_X_MASK;
-	if (keystate[SDLK_s])
-		snes_joypad |= SNES_Y_MASK;
-	if (keystate[SDLK_RETURN])
-		snes_joypad |= SNES_START_MASK;
-	if (keystate[SDLK_SPACE])
-		snes_joypad |= SNES_SELECT_MASK;
-	if (keystate[SDLK_q])
-		snes_joypad |= SNES_TL_MASK;
-	if (keystate[SDLK_w])
-		snes_joypad |= SNES_TR_MASK;
+    Uint8 *keystate =
+        SDL_GetKeyState(NULL);
 
-	if (keystate[SDLK_ESCAPE])
-		GameLooping = false;
+    if (keystate[SDLK_UP])
+        snes_joypad |= SNES_UP_MASK;
+
+    if (keystate[SDLK_DOWN])
+        snes_joypad |= SNES_DOWN_MASK;
+
+    if (keystate[SDLK_LEFT])
+        snes_joypad |= SNES_LEFT_MASK;
+
+    if (keystate[SDLK_RIGHT])
+        snes_joypad |= SNES_RIGHT_MASK;
+
+    if (keystate[SDLK_b])
+        snes_joypad |= SNES_A_MASK;
+
+    if (keystate[SDLK_d])
+        snes_joypad |= SNES_B_MASK;
+
+    if (keystate[SDLK_a])
+        snes_joypad |= SNES_X_MASK;
+
+    if (keystate[SDLK_c])
+        snes_joypad |= SNES_Y_MASK;
+
+    if (keystate[SDLK_RETURN])
+        snes_joypad |= SNES_START_MASK;
+
+    if (keystate[SDLK_SPACE])
+        snes_joypad |= SNES_SELECT_MASK;
+
+    if (keystate[SDLK_q])
+        snes_joypad |= SNES_TL_MASK;
+
+    if (keystate[SDLK_w])
+        snes_joypad |= SNES_TR_MASK;
+
+    if (keystate[SDLK_ESCAPE])
+        GameLooping = false;
 }
+
+// =========================================================
+// JOYPAD CALLBACK
+// =========================================================
 
 uint32 S9xReadJoypad(int port)
 {
-	if (port == 0)
-		return snes_joypad;
-	return 0x80000000;
+    if (port == 0)
+        return snes_joypad;
+
+    return 0x80000000;
 }
 
 // =========================================================
-// FUNCIÓN DE ENTRADA LLAMADA DESDE MAIN.CPP
+// MAIN
 // =========================================================
-extern "C" void run_snes_emulator(const char *fn)
+
+extern "C"
+void run_snes_emulator(const char *fn)
 {
-	ZeroMemory(&Settings, sizeof(Settings));
+    ZeroMemory(&Settings, sizeof(Settings));
 
-	Settings.SoundPlaybackRate = 4;	// 22050Hz
-	Settings.Stereo = TRUE;
-	Settings.SoundBufferSize = 1024;
-	Settings.CyclesPercentage = 100;
-	Settings.DisableSoundEcho = FALSE;
-	Settings.APUEnabled = Settings.NextAPUEnabled = TRUE;
-	Settings.H_Max = SNES_CYCLES_PER_SCANLINE;
-	Settings.ShutdownMaster = TRUE;
-	Settings.FrameTimePAL = 22000;
-	Settings.FrameTimeNTSC = 16667;
-	Settings.FrameTime = Settings.FrameTimeNTSC;
-	Settings.DisableSampleCaching = FALSE;
-	Settings.DisableMasterVolume = FALSE; 
-	Settings.Transparency = TRUE;
-	Settings.SixteenBit = TRUE;
-	Settings.SupportHiRes = FALSE;
-	
-	SoundData.master_volume_left = 127;
-	SoundData.master_volume_right = 127;
-	SoundData.master_volume[0] = 127;
-	SoundData.master_volume[1] = 127;
+    // =====================================================
+    // SETTINGS
+    // =====================================================
 
-	Settings.NextAPUEnabled = TRUE;
-	Settings.HBlankStart = (256 * Settings.H_Max) / SNES_HCOUNTER_MAX;
+    Settings.SoundPlaybackRate =
+        SNES_SAMPLE_RATE;
 
-	if (!Memory.Init() || !S9xInitAPU())
-		return;
+    Settings.Stereo = TRUE;
 
-	GFX.Screen = (uint8 *) malloc(320 * 240 * 2);
-	GFX.Pitch = 320 * 2;
-	GFX.SubScreen = (uint8 *) malloc(512 * 480 * 2);
-	GFX.ZBuffer = (uint8 *) malloc(512 * 480 * 2);
-	GFX.SubZBuffer = (uint8 *) malloc(512 * 480 * 2);
+    Settings.SoundBufferSize =
+        AUDIO_SAMPLES;
 
-	if (!S9xGraphicsInit())
-		return;
+    Settings.CyclesPercentage = 100;
 
-	// 1. CARGAMOS LA ROM
-	if (!Memory.LoadROM(fn))
-		return;
+    Settings.DisableSoundEcho = FALSE;
 
-	// 2. DISPARADORES DE AUDIO TRAS LA RAM LIMPIA
-	S9xOpenSoundDevice(Settings.SoundPlaybackRate, Settings.Stereo, Settings.SoundBufferSize);
-	S9xSetPlaybackRate(22050); 
-	S9xResetSound(FALSE);      // Reseteo forzado del procesador de audio clasico
-	S9xSetSoundControl(0xFF);  // Habilitar todos los canales
-	S9xSetSoundMute(FALSE);    // Desactivar mute por hardware
-	S9xSetRenderPixelFormat(RGB565);
+    Settings.APUEnabled = TRUE;
+    Settings.NextAPUEnabled = TRUE;
 
-	SDL_Surface *screen = SDL_SetVideoMode(320, 240, 16, SDL_HWSURFACE | SDL_DOUBLEBUF);
-	if (!screen)
-		return;
+    Settings.H_Max =
+        SNES_CYCLES_PER_SCANLINE;
 
-	GameLooping = true;
-	SDL_Event event;
+    Settings.ShutdownMaster = TRUE;
 
-	while (GameLooping)
-	{
-		while (SDL_PollEvent(&event))
-		{
-			if (event.type == SDL_QUIT)
-				GameLooping = false;
-		}
+    Settings.FrameTimePAL = 20000;
 
-		do_snes_keypad();
-		
-		// Corre un fotograma completo de emulación
-		S9xMainLoop();
+    Settings.FrameTimeNTSC = 16667;
 
-		// Regula FPS y extrae el audio mezclado hacia SDL
-		S9xSyncSpeed();
+    Settings.FrameTime =
+        Settings.FrameTimeNTSC;
 
-		SDL_LockSurface(screen);
+    Settings.DisableSampleCaching =
+        FALSE;
 
-		uint16_t *snes_buffer = (uint16_t *) GFX.Screen;
-		uint16_t *sdl_pixels = (uint16_t *) screen->pixels;
-		int sdl_pitch = screen->pitch / 2;	
+    Settings.DisableMasterVolume =
+        FALSE;
 
-		const int snes_w = 256;
-		const int snes_h = 224;
+    Settings.Transparency = TRUE;
 
-		for (int y = 0; y < 240; y++)
-		{
-			int snes_y = (y * snes_h) / 240;
-			uint16_t *src_row = snes_buffer + (snes_y * 320);	
-			uint16_t *dest_row = sdl_pixels + (y * sdl_pitch);
+    Settings.SixteenBit = TRUE;
 
-			for (int x = 0; x < 320; x++)
-			{
-				int snes_x = (x * snes_w) / 320;
-				dest_row[x] = src_row[snes_x];
-			}
-		}
+    Settings.SupportHiRes = FALSE;
 
-		SDL_UnlockSurface(screen);
-		SDL_Flip(screen);
-	}
+    Settings.HBlankStart =
+        (256 * Settings.H_Max) /
+        SNES_HCOUNTER_MAX;
 
-	SDL_CloseAudio();
-	Memory.Deinit();
-	S9xDeinitAPU();
-	S9xGraphicsDeinit();
+    // =====================================================
+    // VOLUME
+    // =====================================================
 
-	if (GFX.Screen) { free(GFX.Screen); GFX.Screen = NULL; }
-	if (GFX.SubScreen) { free(GFX.SubScreen); GFX.SubScreen = NULL; }
-	if (GFX.ZBuffer) { free(GFX.ZBuffer); GFX.ZBuffer = NULL; }
-	if (GFX.SubZBuffer) { free(GFX.SubZBuffer); GFX.SubZBuffer = NULL; }
+    SoundData.master_volume_left = 127;
+    SoundData.master_volume_right = 127;
+
+    // =====================================================
+    // INIT CORE
+    // =====================================================
+
+    if (!Memory.Init())
+        return;
+
+    if (!S9xInitAPU())
+        return;
+
+    // =====================================================
+    // GFX
+    // =====================================================
+
+    GFX.Screen =
+        (uint8 *)malloc(320 * 240 * 2);
+
+    GFX.Pitch = 320 * 2;
+
+    GFX.SubScreen =
+        (uint8 *)malloc(512 * 480 * 2);
+
+    GFX.ZBuffer =
+        (uint8 *)malloc(512 * 480);
+
+    GFX.SubZBuffer =
+        (uint8 *)malloc(512 * 480);
+
+    if (!S9xGraphicsInit())
+        return;
+
+    // =====================================================
+    // LOAD ROM
+    // =====================================================
+
+    if (!Memory.LoadROM(fn))
+    {
+        printf("ROM load failed\n");
+        return;
+    }
+
+    // =====================================================
+    // AUDIO
+    // =====================================================
+
+    if (!S9xOpenSoundDevice(
+            Settings.SoundPlaybackRate,
+            Settings.Stereo,
+            Settings.SoundBufferSize))
+    {
+        return;
+    }
+
+    S9xSetPlaybackRate(
+        SNES_SAMPLE_RATE);
+
+    S9xResetSound(FALSE);
+
+    S9xSetSoundControl(0xFF);
+
+    S9xSetSoundMute(FALSE);
+
+    // =====================================================
+    // VIDEO
+    // =====================================================
+
+    S9xSetRenderPixelFormat(RGB565);
+
+    SDL_Surface *screen =
+        SDL_SetVideoMode(
+            320,
+            240,
+            16,
+            SDL_DOUBLEBUF);
+
+    if (!screen)
+    {
+        printf("SDL_SetVideoMode failed\n");
+        return;
+    }
+
+    // =====================================================
+    // MAIN LOOP
+    // =====================================================
+
+    GameLooping = true;
+
+    SDL_Event event;
+
+    while (GameLooping)
+    {
+        while (SDL_PollEvent(&event))
+        {
+            if (event.type == SDL_QUIT)
+            {
+                GameLooping = false;
+            }
+        }
+
+        // INPUT
+        do_snes_keypad();
+
+        // EMULATE FRAME
+        S9xMainLoop();
+
+        // AUDIO
+        S9xProcessSound();
+
+        // SYNC
+        S9xSyncSpeed();
+
+        // VIDEO
+        if (SDL_MUSTLOCK(screen))
+            SDL_LockSurface(screen);
+
+        memset(
+            screen->pixels,
+            0,
+            screen->pitch * 240);
+
+        uint16_t *src =
+            (uint16_t *)GFX.Screen;
+
+        uint16_t *dst =
+            (uint16_t *)screen->pixels;
+
+        int pitch =
+            screen->pitch / 2;
+
+        int margin_x = 32;
+        int margin_y = 8;
+
+        for (int y = 0; y < 224; y++)
+        {
+            uint16_t *src_row =
+                src + (y * 320);
+
+            uint16_t *dst_row =
+                dst +
+                ((y + margin_y) * pitch) +
+                margin_x;
+
+            memcpy(
+                dst_row,
+                src_row,
+                256 * sizeof(uint16_t));
+        }
+
+        if (SDL_MUSTLOCK(screen))
+            SDL_UnlockSurface(screen);
+
+        SDL_Flip(screen);
+    }
+
+    // =====================================================
+    // CLEANUP
+    // =====================================================
+
+    SDL_CloseAudio();
+
+    Memory.Deinit();
+
+    S9xDeinitAPU();
+
+    S9xGraphicsDeinit();
+
+    if (GFX.Screen)
+    {
+        free(GFX.Screen);
+        GFX.Screen = NULL;
+    }
+
+    if (GFX.SubScreen)
+    {
+        free(GFX.SubScreen);
+        GFX.SubScreen = NULL;
+    }
+
+    if (GFX.ZBuffer)
+    {
+        free(GFX.ZBuffer);
+        GFX.ZBuffer = NULL;
+    }
+
+    if (GFX.SubZBuffer)
+    {
+        free(GFX.SubZBuffer);
+        GFX.SubZBuffer = NULL;
+    }
 }
+
+// =========================================================
+// STUBS
+// =========================================================
 
 void S9xExit()
 {
-	GameLooping = false;
+    GameLooping = false;
 }
 
-bool8 S9xReadMousePosition(int which1, int *x, int *y, uint32 * buttons)
+bool8 S9xReadMousePosition(
+    int which1,
+    int *x,
+    int *y,
+    uint32 *buttons)
 {
-	return FALSE;
+    return FALSE;
 }
 
-bool8 S9xReadSuperScopePosition(int *x, int *y, uint32 * buttons)
+bool8 S9xReadSuperScopePosition(
+    int *x,
+    int *y,
+    uint32 *buttons)
 {
-	return FALSE;
+    return FALSE;
 }
 
 void S9xAutoSaveSRAM()
@@ -315,40 +564,31 @@ void S9xAutoSaveSRAM()
 
 extern "C"
 {
-	void S9xMessage(int type, int number, const char *message)
-	{
-	}
+    void S9xMessage(
+        int type,
+        int number,
+        const char *message)
+    {
+    }
 
-	void S9xGenerateSound()
-	{
-		// Satisface cpuexec.cpp sin causar errores de enlazador
-	}
+    void S9xGenerateSound()
+    {
+    }
 
-	void S9xPutImage(int width, int height)
-	{
-		// Satisface display.h
-	}
+    void S9xPutImage(
+        int width,
+        int height)
+    {
+    }
 
-	bool8_32 S9xDeinitUpdate(int width, int height)
-	{
-		return TRUE;
-	}
+    bool8_32 S9xDeinitUpdate(
+        int width,
+        int height)
+    {
+        return TRUE;
+    }
 
-	void S9xSetPalette()
-	{
-	}
-
-	bool8 S9xOpenSnapshotFile(const char *filepath, bool8 read_only, STREAM * stream)
-	{
-		if (read_only)
-			*stream = OPEN_STREAM(filepath, "rb");
-		else
-			*stream = OPEN_STREAM(filepath, "wb");
-		return (*stream != NULL);
-	}
-
-	void S9xCloseSnapshotFile(STREAM stream)
-	{
-		CLOSE_STREAM(stream);
-	}
+    void S9xSetPalette()
+    {
+    }
 }

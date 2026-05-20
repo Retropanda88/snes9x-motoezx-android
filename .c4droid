@@ -1,4 +1,4 @@
-#Tue May 19 14:37:49 CST 2026
+#Tue May 19 23:10:13 CST 2026
 binary_fname=snesemu
 prepare_cmds=export PATH\=/busybox-virtual\:(c4droid\:DATADIR)\:(c4droid\:GCCROOT)bin\:(c4droid\:GCCROOT)(c4droid\:PREFIX)/bin/\:$PATH\nexport CC\="(c4droid\:PREFIX)-gcc (c4droid\:PIE) (c4droid\:MAKEMODEARGS)"\nexport CXX\="(c4droid\:PREFIX)-g++ (c4droid\:PIE) (c4droid\:MAKEMODEARGS)"\nexport SHELL\="(c4droid\:DATADIR)sh"\nexport TMPDIR\=(c4droid\:GCCROOT)tmpdir\ncd (c4droid\:CURSRCDIR)
 sm_names=snes_player.cpp main.cpp

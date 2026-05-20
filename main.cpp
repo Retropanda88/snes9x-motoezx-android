@@ -13,7 +13,7 @@ int main(int argc, char *argv[])
 		// ...
 	}
 
-	const char *rom_to_load = "game3.smc";	// Nombre de la ROM por defecto
+	const char *rom_to_load = "game2.smc";	// Nombre de la ROM por defecto
 
 	printf("[SISTEMA] Inicializando cargador del emulador de SNES...\n");
 
